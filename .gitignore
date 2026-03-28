@@ -1,0 +1,17 @@
+.DS_Store
+.venv/
+__pycache__/
+*.pyc
+
+# Generated presentations and local office artifacts
+*.pptx
+*.key
+*.zip
+presentations/
+
+# Keep the source template in the repository
+!Operating systems002.pptx
+
+# Common editor noise
+.idea/
+.vscode/
