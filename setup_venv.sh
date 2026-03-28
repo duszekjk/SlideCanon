@@ -21,4 +21,4 @@ echo
 echo "Virtual environment created in: $VENV_DIR"
 echo "Activate it with: source $VENV_DIR/bin/activate"
 echo "Then run for example:"
-echo "  python $SCRIPT_DIR/md_template_pptx_builder.py --help"
+echo "  python $SCRIPT_DIR/slidecanon.py --help"

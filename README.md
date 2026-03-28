@@ -1,4 +1,6 @@
-# Markdown -> PPTX builder with real template layouts
+# SlideCanon
+
+SlideCanon turns structured lecture markdown into PowerPoint decks while preserving real PPTX template layouts and presenter notes.
 
 This script is meant for a lecture-style markdown format like:
 
@@ -38,7 +40,7 @@ It tries these by name, in order, and uses the first matching layout.
 
 ## Repository contents
 
-- `md_template_pptx_builder.py`: main builder script
+- `slidecanon.py`: main builder script
 - `lecture_template.pptx`: minimal starter template with the original slide master and layout set preserved
 - `example_lecture.md`: small example input file
 - `example-assets/sample-photo.png`: tiny image asset used by the example template and markdown
@@ -46,7 +48,7 @@ It tries these by name, in order, and uses the first matching layout.
 ## Usage
 
 ```bash
-python md_template_pptx_builder.py \
+python slidecanon.py \
   --markdown /path/to/example_lecture.md \
   --template /path/to/lecture_template.pptx \
   --output /path/to/example_lecture_out.pptx \
@@ -56,7 +58,7 @@ python md_template_pptx_builder.py \
 From this repository root, that becomes:
 
 ```bash
-python md_template_pptx_builder.py \
+python slidecanon.py \
   --markdown example_lecture.md \
   --template lecture_template.pptx \
   --output example_lecture_out.pptx \
@@ -86,7 +88,7 @@ If the markdown content is much longer than the template placeholder was designe
 Create and populate a virtual environment:
 
 ```bash
-cd /path/to/pptx_markdown_builder
+cd /path/to/SlideCanon
 ./setup_venv.sh .venv
 source .venv/bin/activate
 ```
