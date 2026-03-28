@@ -1,6 +1,6 @@
-# Markdown → PPTX builder with real template layouts
+# Markdown -> PPTX builder with real template layouts
 
-This script is meant for the lecture markdown format used in your files:
+This script is meant for a lecture-style markdown format like:
 
 - `#slide N`
 - `## layout`
@@ -36,13 +36,30 @@ The script was written against templates like:
 
 It tries these by name, in order, and uses the first matching layout.
 
+## Repository contents
+
+- `md_template_pptx_builder.py`: main builder script
+- `lecture_template.pptx`: minimal starter template with the original slide master and layout set preserved
+- `example_lecture.md`: small example input file
+- `example-assets/sample-photo.png`: tiny image asset used by the example template and markdown
+
 ## Usage
 
 ```bash
 python md_template_pptx_builder.py \
-  --markdown /path/to/lecture3_draft-5.md \
-  --template "/path/to/Operating systems002.pptx" \
-  --output /path/to/lecture3_draft-5_out.pptx \
+  --markdown /path/to/example_lecture.md \
+  --template /path/to/lecture_template.pptx \
+  --output /path/to/example_lecture_out.pptx \
+  --verbose
+```
+
+From this repository root, that becomes:
+
+```bash
+python md_template_pptx_builder.py \
+  --markdown example_lecture.md \
+  --template lecture_template.pptx \
+  --output example_lecture_out.pptx \
   --verbose
 ```
 
@@ -58,6 +75,7 @@ python md_template_pptx_builder.py \
 - The script does not invent diagrams from prose. It only places existing image assets into picture placeholders.
 - For YouTube links, it adds the URL into the body placeholder as clickable text.
 - Run with `--verbose` to print warnings for slides whose images could not be resolved.
+- The repository intentionally does not include a `presentations/` archive of generated lecture decks.
 
 ## Important limitation
 

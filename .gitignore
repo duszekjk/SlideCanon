@@ -10,7 +10,7 @@ __pycache__/
 presentations/
 
 # Keep the source template in the repository
-!Operating systems002.pptx
+!lecture_template.pptx
 
 # Common editor noise
 .idea/
