@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import os
 import re
 import shutil
@@ -11,9 +12,53 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import xml.etree.ElementTree as ET
+from xml.sax.saxutils import escape
 
+from PIL import Image as PILImage
 from pptx import Presentation
+from pptx.dml.color import RGBColor
 from pptx.enum.shapes import PP_PLACEHOLDER
+from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
+from pptx.util import Pt
+try:
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_CENTER
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import mm
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    from reportlab.platypus import (
+        Flowable,
+        HRFlowable,
+        Image as RLImage,
+        KeepTogether,
+        PageBreak,
+        Paragraph,
+        SimpleDocTemplate,
+        Spacer,
+        Table,
+        TableStyle,
+    )
+except ImportError:  # pragma: no cover - handled at runtime
+    colors = None
+    TA_CENTER = None
+    A4 = None
+    ParagraphStyle = None
+    getSampleStyleSheet = None
+    mm = None
+    pdfmetrics = None
+    TTFont = None
+    Flowable = None
+    HRFlowable = None
+    KeepTogether = None
+    PageBreak = None
+    RLImage = None
+    Paragraph = None
+    SimpleDocTemplate = None
+    Spacer = None
+    Table = None
+    TableStyle = None
 
 NS = {
     "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
@@ -27,6 +72,20 @@ IMAGE_KEYS = ["image", "photo", "visual", "visualization", "visualisation", "cha
 IMAGE_MARKDOWN_RE = re.compile(r"!\[([^\]]*)\]\(([^)]+)\)")
 SLIDE_SPLIT_RE = re.compile(r"(?m)^#slide\s+(\d+)\s*$")
 SECTION_RE = re.compile(r"(?m)^##\s+([^\n]+)\n")
+STORY_LAYOUTS = {"story", "narrative", "case", "case study"}
+COMPARISON_LAYOUTS = {"comparison", "compare", "split", "two-column", "two columns", "two column"}
+IMAGE_LAYOUTS = {
+    "photo",
+    "image",
+    "visual",
+    "visualisation",
+    "visualization",
+    "chart",
+    "bullet + image",
+    "bullet+image",
+    "image + bullet",
+    "image+bullet",
+}
 
 
 @dataclass
@@ -53,6 +112,99 @@ class PicturePlaceholderInfo:
     idx: Optional[int]
 
 
+@dataclass
+class PdfStyles:
+    cover_kicker: ParagraphStyle
+    cover_title: ParagraphStyle
+    cover_subtitle: ParagraphStyle
+    toc_heading: ParagraphStyle
+    toc_item: ParagraphStyle
+    title: ParagraphStyle
+    slide_heading: ParagraphStyle
+    subtitle: ParagraphStyle
+    body: ParagraphStyle
+    bullet: ParagraphStyle
+    callout_label: ParagraphStyle
+    callout_body: ParagraphStyle
+    notes_label: ParagraphStyle
+    notes: ParagraphStyle
+    caption: ParagraphStyle
+
+
+def register_pdf_fonts() -> Dict[str, str]:
+    fallback = {
+        "regular": "Helvetica",
+        "bold": "Helvetica-Bold",
+        "italic": "Helvetica-Oblique",
+        "bold_italic": "Helvetica-BoldOblique",
+    }
+    if pdfmetrics is None or TTFont is None:
+        return fallback
+
+    candidates = [
+        {
+            "regular": "/System/Library/Fonts/Supplemental/Arial.ttf",
+            "bold": "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+            "italic": "/System/Library/Fonts/Supplemental/Arial Italic.ttf",
+            "bold_italic": "/System/Library/Fonts/Supplemental/Arial Bold Italic.ttf",
+            "prefix": "SlideCanonArial",
+        },
+        {
+            "regular": "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+            "bold": "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+            "italic": "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+            "bold_italic": "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+            "prefix": "SlideCanonArialUnicode",
+        },
+    ]
+
+    for candidate in candidates:
+        if not all(Path(path).exists() for path in candidate.values() if path != candidate["prefix"]):
+            continue
+        try:
+            names = {
+                "regular": f"{candidate['prefix']}-Regular",
+                "bold": f"{candidate['prefix']}-Bold",
+                "italic": f"{candidate['prefix']}-Italic",
+                "bold_italic": f"{candidate['prefix']}-BoldItalic",
+            }
+            pdfmetrics.registerFont(TTFont(names["regular"], candidate["regular"]))
+            pdfmetrics.registerFont(TTFont(names["bold"], candidate["bold"]))
+            pdfmetrics.registerFont(TTFont(names["italic"], candidate["italic"]))
+            pdfmetrics.registerFont(TTFont(names["bold_italic"], candidate["bold_italic"]))
+            return names
+        except Exception:
+            continue
+    return fallback
+
+
+class OverlapImage(Flowable):
+    def __init__(
+        self,
+        path: Path,
+        width: float,
+        height: float,
+        layout_reduction_ratio: float = 0.25,
+        bleed_ratio: float = 0.05,
+    ):
+        super().__init__()
+        self.path = str(path)
+        self.drawWidth = width
+        self.drawHeight = height
+        self.layout_reduction_ratio = max(0.0, min(layout_reduction_ratio, 0.3))
+        self.bleed_ratio = max(0.0, min(bleed_ratio, 0.2))
+        self._image = RLImage(self.path, width=width, height=height)
+        self.width = width
+        self.height = height * max(0.1, 1.0 - self.layout_reduction_ratio)
+
+    def wrap(self, availWidth, availHeight):
+        return self.width, self.height
+
+    def drawOn(self, canvas, x, y, _sW=0):
+        upward_bleed = self.drawHeight * self.bleed_ratio
+        self._image.drawOn(canvas, x, y - upward_bleed, _sW=_sW)
+
+
 def parse_markdown(md_path: Path) -> List[SlideSpec]:
     text = md_path.read_text(encoding="utf-8", errors="ignore").replace("\r\n", "\n")
     matches = list(SLIDE_SPLIT_RE.finditer(text))
@@ -70,6 +222,22 @@ def parse_markdown(md_path: Path) -> List[SlideSpec]:
             send = sec_matches[j + 1].start() if j + 1 < len(sec_matches) else len(block)
             value = block[sstart:send].strip()
             fields[key] = value
+        # Auto-split long titles into subtitle when subtitle is missing.
+        # If the author writes e.g. "Ciphering mode: decyzja, negocjacja i konsekwencje" as slide title
+        # and omits subtitle, move the part after ':' into subtitle.
+        if "subtitle" not in fields or not fields.get("subtitle", "").strip():
+            raw_title = (fields.get("slide title") or fields.get("title") or "").strip()
+            if ":" in raw_title:
+                left, right = raw_title.split(":", 1)
+                left = left.strip()
+                right = right.strip()
+                if left and right and len(right) >= 6:
+                    if fields.get("slide title"):
+                        fields["slide title"] = left
+                    elif fields.get("title"):
+                        fields["title"] = left
+                    fields["subtitle"] = right
+
         slides.append(SlideSpec(number=number, fields=fields))
     return slides
 
@@ -133,29 +301,70 @@ def picture_placeholders(slide) -> List[PicturePlaceholderInfo]:
     return sorted(items, key=lambda s: (s.shape.top, s.shape.left))
 
 
-def choose_layout_name(spec: SlideSpec) -> List[str]:
+def choose_layout_name(spec: SlideSpec, base_dir: Optional[Path] = None) -> List[str]:
     layout = spec.get("layout").lower().strip()
-    images = extract_images_from_spec(spec, Path("."), resolve=False)
+    resolve_base = base_dir or Path(".")
+    images = extract_images_from_spec(spec, resolve_base, resolve=base_dir is not None)
     has_img = bool(images)
     has_bullets = bool(normalize_bullets(spec.get("bullets")))
     has_subtitle = bool((spec.get("subtitle") or "").strip())
     has_title = bool((spec.get("slide title") or spec.get("title") or "").strip())
+    has_comparison = any(
+        (spec.get(key) or "").strip()
+        for key in ("left title", "left bullets", "right title", "right bullets")
+    )
 
     if layout in {"definition", "quote", "statement", "fact"}:
         return ["Quote", "Statement", "Big Fact", "Definition"]
-    if layout in {"title", "section"} and not has_img:
+    if layout in STORY_LAYOUTS:
+        return ["Statement", "Quote", "Big Fact", "Title Only", "Title & Bullets"]
+    if layout in COMPARISON_LAYOUTS or has_comparison:
+        return [
+            "Comparison",
+            "Two Content",
+            "Two Columns",
+            "Title + Two Content",
+            "Title + 2 Content",
+            "Title & Bullets",
+            "Bullets",
+        ]
+    if layout == "section" and not has_img:
+        return ["Section", "Title", "Title Only"]
+    if layout == "title" and not has_img:
         return ["Title", "Section", "Title Only"]
 
-    if has_img or layout in {"photo", "image", "visual", "visualisation", "visualization", "chart"}:
-        # Prefer real picture-placeholder layouts first.
-        # In Operating systems002.pptx, 'Title & Photo' has a real picture placeholder,
-        # while 'Title, Bullets & Photo' does not.
+    if has_img or layout in IMAGE_LAYOUTS:
+        wide_image = False
+        if base_dir is not None:
+            for image in images:
+                if not image.path:
+                    continue
+                try:
+                    with PILImage.open(image.path) as img:
+                        width, height = img.size
+                    if height and width / height > 1.15:
+                        wide_image = True
+                        break
+                except Exception:
+                    continue
+        # Prefer the layout that best matches the updated template structure.
         prefs: List[str] = []
-        if has_title and (has_subtitle or has_bullets):
-            prefs += ["Title & Photo", "Title & Photo Alt"]
-        if has_title and not has_bullets and not has_subtitle:
-            prefs += ["Title & Photo", "Title & Photo Alt", "Photo"]
+        if wide_image:
+            if has_title and has_bullets:
+                prefs += ["Title & Photo Alt", "Title & Photo", "Title, Bullets & Photo"]
+            elif has_title and has_subtitle:
+                prefs += ["Title & Photo Alt", "Title & Photo", "Title, Bullets & Photo"]
+            elif has_title:
+                prefs += ["Title & Photo Alt", "Title & Photo", "Photo"]
+        else:
+            if has_title and has_bullets:
+                prefs += ["Title, Bullets & Photo", "Title & Photo", "Title & Photo Alt"]
+            elif has_title and has_subtitle:
+                prefs += ["Title & Photo", "Title & Photo Alt", "Title, Bullets & Photo"]
+            if has_title and not has_bullets and not has_subtitle:
+                prefs += ["Title & Photo", "Title & Photo Alt", "Photo"]
         prefs += [
+            "Title, Bullets & Photo",
             "Title & Photo",
             "Title & Photo Alt",
             "Photo",
@@ -163,7 +372,6 @@ def choose_layout_name(spec: SlideSpec) -> List[str]:
             # Fallback-only candidates if the template has custom names.
             "Title + Subtitle + Bullets + Photo",
             "Bullets & Photo",
-            "Title, Bullets & Photo",
             "Comparison",
         ]
         return prefs
@@ -284,6 +492,15 @@ def fill_bullets(tf, bullets: List[Tuple[int, str]], trailing_link: Optional[str
         p.text = trailing_link
 
 
+def comparison_text(title: str, bullets: List[Tuple[int, str]]) -> str:
+    lines: List[str] = []
+    if title.strip():
+        lines.append(title.strip())
+    for level, text in bullets:
+        lines.append(f'{"  " * level}• {text}')
+    return "\n".join(lines).strip()
+
+
 def add_youtube_link_to_body(tf, url: str):
     url = url.strip()
     if not url:
@@ -359,9 +576,18 @@ def populate_slide(slide, spec: SlideSpec, base_dir: Path, verbose: bool = False
     attribution = spec.get("attribution")
     term = spec.get("term")
     definition = spec.get("definition")
+    story = spec.get("story")
+    left_title = spec.get("left title")
+    left_bullets = normalize_bullets(spec.get("left bullets"))
+    right_title = spec.get("right title")
+    right_bullets = normalize_bullets(spec.get("right bullets"))
     youtube = spec.get("youtube") or spec.get("video") or spec.get("link")
     images = [img for img in extract_images_from_spec(spec, base_dir, resolve=True) if img.path]
     missing_images = [img for img in extract_images_from_spec(spec, base_dir, resolve=True) if not img.path]
+    is_story = layout in STORY_LAYOUTS or bool(story.strip())
+    is_comparison = layout in COMPARISON_LAYOUTS or any(
+        (value or "").strip() for value in (left_title, spec.get("left bullets"), right_title, spec.get("right bullets"))
+    )
 
     if slide.shapes.title is not None and title:
         slide.shapes.title.text = title
@@ -369,14 +595,60 @@ def populate_slide(slide, spec: SlideSpec, base_dir: Path, verbose: bool = False
     bodies = body_placeholders(slide)
     pics = picture_placeholders(slide)
 
-    if layout in {"definition", "quote", "statement", "fact"} or (term and definition):
+    if is_comparison:
+        upper = bodies[0] if bodies else None
+        columns = bodies[1:3] if len(bodies) >= 3 else bodies[:2]
+        left_text = comparison_text(left_title, left_bullets)
+        right_text = comparison_text(right_title, right_bullets)
+        if upper is not None:
+            if subtitle:
+                set_textframe_plain(upper.text_frame, subtitle)
+            elif len(bodies) >= 3:
+                upper.text_frame.clear()
+        if len(columns) >= 2:
+            if left_text:
+                set_textframe_plain(columns[0].text_frame, left_text)
+            if right_text:
+                set_textframe_plain(columns[1].text_frame, right_text)
+        elif len(bodies) == 1:
+            blocks = [block for block in (left_text, right_text) if block]
+            if blocks:
+                set_textframe_plain(bodies[0].text_frame, "\n\n".join(blocks))
+    elif is_story:
+        main_text = story or spec.get("content") or subtitle or ""
+        if bodies:
+            set_textframe_plain(bodies[0].text_frame, main_text)
+        elif slide.shapes.title is not None and not title and main_text:
+            slide.shapes.title.text = main_text
+    elif layout in {"definition", "quote", "statement", "fact"} or (term and definition):
         main_text = definition or quote or spec.get("content")
-        if term and definition:
+        if term and definition and term.strip().casefold() != title.strip().casefold():
             main_text = f"{term}\n\n{definition}"
         if bodies:
             set_textframe_plain(bodies[0].text_frame, main_text)
         if len(bodies) > 1 and attribution:
             set_textframe_plain(bodies[1].text_frame, attribution)
+        # The supplied template maps definitions to its Quote layout, which has
+        # no title placeholder. Add the concept name in a separate title box.
+        if layout == "definition" and title and slide.shapes.title is None:
+            reference = bodies[0] if bodies else None
+            left = reference.left if reference is not None else 736600
+            width = reference.width if reference is not None else 11531600
+            heading = slide.shapes.add_textbox(left, 1550000, width, 850000)
+            heading.name = "Definition Title"
+            frame = heading.text_frame
+            frame.clear()
+            frame.margin_left = frame.margin_right = 0
+            frame.margin_top = frame.margin_bottom = 0
+            frame.vertical_anchor = MSO_ANCHOR.MIDDLE
+            paragraph = frame.paragraphs[0]
+            paragraph.alignment = PP_ALIGN.CENTER
+            run = paragraph.add_run()
+            run.text = title
+            run.font.name = "Arial"
+            run.font.size = Pt(32)
+            run.font.bold = True
+            run.font.color.rgb = RGBColor(19, 79, 120)
     else:
         if len(bodies) >= 2:
             upper, lower = bodies[0], bodies[-1]
@@ -436,6 +708,466 @@ def populate_slide(slide, spec: SlideSpec, base_dir: Path, verbose: bool = False
                 print(f"[slide {spec.number}] Could not write notes: {exc}")
 
 
+def create_pdf_styles() -> PdfStyles:
+    if getSampleStyleSheet is None or ParagraphStyle is None or colors is None:
+        raise RuntimeError("PDF generation requires reportlab. Install it with: python -m pip install -r requirements.txt")
+    styles = getSampleStyleSheet()
+    fonts = register_pdf_fonts()
+    scale = 1.5
+    return PdfStyles(
+        cover_kicker=ParagraphStyle(
+            "CoverKicker",
+            parent=styles["BodyText"],
+            fontName=fonts["bold"],
+            fontSize=10 * scale,
+            leading=13 * scale,
+            textColor=colors.HexColor("#A44914"),
+            spaceAfter=4 * mm,
+            tracking=0.5,
+        ),
+        cover_title=ParagraphStyle(
+            "CoverTitle",
+            parent=styles["Title"],
+            fontName=fonts["bold"],
+            fontSize=24 * scale,
+            leading=30 * scale,
+            textColor=colors.HexColor("#1C1C1C"),
+            spaceAfter=4 * mm,
+        ),
+        cover_subtitle=ParagraphStyle(
+            "CoverSubtitle",
+            parent=styles["BodyText"],
+            fontName=fonts["regular"],
+            fontSize=12 * scale,
+            leading=17 * scale,
+            textColor=colors.HexColor("#4B5563"),
+            spaceAfter=3 * mm,
+        ),
+        toc_heading=ParagraphStyle(
+            "TocHeading",
+            parent=styles["Heading2"],
+            fontName=fonts["bold"],
+            fontSize=14 * scale,
+            leading=18 * scale,
+            textColor=colors.HexColor("#1C1C1C"),
+            spaceAfter=4 * mm,
+        ),
+        toc_item=ParagraphStyle(
+            "TocItem",
+            parent=styles["BodyText"],
+            fontName=fonts["regular"],
+            fontSize=10.2 * scale,
+            leading=13.5 * scale,
+            textColor=colors.HexColor("#374151"),
+            spaceAfter=1.6 * mm,
+        ),
+        title=ParagraphStyle(
+            "BookTitle",
+            parent=styles["Title"],
+            fontName=fonts["bold"],
+            fontSize=15 * scale,
+            leading=19 * scale,
+            textColor=colors.HexColor("#1C1C1C"),
+            spaceAfter=4 * mm,
+        ),
+        slide_heading=ParagraphStyle(
+            "SlideHeading",
+            parent=styles["Heading2"],
+            fontName=fonts["bold"],
+            fontSize=9.2 * scale,
+            leading=12 * scale,
+            textColor=colors.HexColor("#A44914"),
+            backColor=colors.HexColor("#F3E6D8"),
+            borderPadding=(3, 5, 3, 5),
+            spaceBefore=0.5 * mm,
+            spaceAfter=2 * mm,
+        ),
+        subtitle=ParagraphStyle(
+            "Subtitle",
+            parent=styles["BodyText"],
+            fontName=fonts["bold"],
+            fontSize=9.6 * scale,
+            leading=12 * scale,
+            textColor=colors.HexColor("#4F4F4F"),
+            spaceAfter=2.6 * mm,
+        ),
+        body=ParagraphStyle(
+            "Body",
+            parent=styles["BodyText"],
+            fontName=fonts["regular"],
+            fontSize=9.2 * scale,
+            leading=12.2 * scale,
+            textColor=colors.HexColor("#202020"),
+            spaceAfter=1.9 * mm,
+        ),
+        bullet=ParagraphStyle(
+            "Bullet",
+            parent=styles["BodyText"],
+            fontName=fonts["regular"],
+            fontSize=9.2 * scale,
+            leading=11.8 * scale,
+            leftIndent=6 * mm,
+            firstLineIndent=-3.2 * mm,
+            bulletIndent=0,
+            spaceAfter=1 * mm,
+        ),
+        callout_label=ParagraphStyle(
+            "CalloutLabel",
+            parent=styles["Heading4"],
+            fontName=fonts["bold"],
+            fontSize=9.6 * scale,
+            leading=12 * scale,
+            textColor=colors.HexColor("#8A3F10"),
+            backColor=colors.HexColor("#F8EADB"),
+            borderPadding=(3, 5, 3, 5),
+            spaceBefore=1.5 * mm,
+            spaceAfter=1.8 * mm,
+        ),
+        callout_body=ParagraphStyle(
+            "CalloutBody",
+            parent=styles["BodyText"],
+            fontName=fonts["regular"],
+            fontSize=9.1 * scale,
+            leading=12.2 * scale,
+            textColor=colors.HexColor("#202020"),
+            backColor=colors.HexColor("#FBF7F0"),
+            borderPadding=(6, 8, 6, 8),
+            borderRadius=4,
+            spaceAfter=2 * mm,
+        ),
+        notes_label=ParagraphStyle(
+            "NotesLabel",
+            parent=styles["Heading4"],
+            fontName=fonts["bold"],
+            fontSize=9.5 * scale,
+            leading=12 * scale,
+            textColor=colors.HexColor("#6B7280"),
+            spaceBefore=3 * mm,
+            spaceAfter=1.5 * mm,
+        ),
+        notes=ParagraphStyle(
+            "Notes",
+            parent=styles["BodyText"],
+            fontName=fonts["italic"],
+            fontSize=9.4 * scale,
+            leading=13 * scale,
+            textColor=colors.HexColor("#4B5563"),
+            backColor=colors.HexColor("#F6F1EA"),
+            borderPadding=(5, 7, 5, 7),
+            borderRadius=4,
+            spaceAfter=2 * mm,
+        ),
+        caption=ParagraphStyle(
+            "Caption",
+            parent=styles["BodyText"],
+            alignment=TA_CENTER,
+            fontName=fonts["regular"],
+            fontSize=8.5 * scale,
+            leading=10.5 * scale,
+            textColor=colors.HexColor("#6B7280"),
+            spaceBefore=1.2 * mm,
+            spaceAfter=1 * mm,
+        ),
+    )
+
+
+def split_text_blocks(text: str) -> List[str]:
+    return [block.strip() for block in re.split(r"\n\s*\n", text.strip()) if block.strip()]
+
+
+def append_paragraph_blocks(story_list, text: str, style: ParagraphStyle):
+    for block in split_text_blocks(text):
+        story_list.append(Paragraph(escape(block).replace("\n", "<br/>"), style))
+
+
+def append_bullet_flowables(story_list, bullets: List[Tuple[int, str]], style: ParagraphStyle):
+    for level, text in bullets:
+        bullet_style = ParagraphStyle(
+            f"{style.name}-{level}",
+            parent=style,
+            leftIndent=style.leftIndent + (level * 5 * mm),
+            firstLineIndent=style.firstLineIndent,
+        )
+        story_list.append(Paragraph(f"- {escape(text)}", bullet_style))
+
+
+def build_pdf_cover(slides: List[SlideSpec], styles: PdfStyles):
+    if not slides:
+        return []
+    first = slides[0]
+    cover_title = first.get("slide title") or first.get("title") or Path("lecture").stem
+    cover_subtitle = first.get("subtitle") or "Lecture notes generated from SlideCanon markdown"
+    return [
+        Spacer(1, 35 * mm),
+        Paragraph("SlideCanon Course Notes", styles.cover_kicker),
+        Paragraph(escape(cover_title), styles.cover_title),
+        Paragraph(escape(cover_subtitle), styles.cover_subtitle),
+        Spacer(1, 6 * mm),
+        HRFlowable(width="100%", color=colors.HexColor("#C37A48"), thickness=1.1),
+        Spacer(1, 7 * mm),
+        Paragraph(
+            f"Generated from structured markdown on {escape(dt.date.today().isoformat())}. "
+            "This PDF keeps slide content, images, and speaker notes in a more readable A4 note format.",
+            styles.body,
+        ),
+        Spacer(1, 10 * mm),
+        PageBreak() if PageBreak is not None else Spacer(1, 0),
+    ]
+
+
+def build_pdf_toc(slides: List[SlideSpec], styles: PdfStyles):
+    items = [Paragraph("Contents", styles.toc_heading), Spacer(1, 2 * mm)]
+    for spec in slides:
+        title = spec.get("slide title") or spec.get("title") or spec.get("term")
+        if title.strip():
+            items.append(Paragraph(f"{spec.number}. {escape(title)}", styles.toc_item))
+    items.append(PageBreak() if PageBreak is not None else Spacer(1, 0))
+    return items
+
+
+def build_pdf_image(
+    path: Path,
+    max_width: float,
+    max_height: float,
+    layout_reduction_ratio: float = 0.0,
+    bleed_ratio: float = 0.0,
+):
+    try:
+        with PILImage.open(path) as img:
+            width, height = img.size
+    except Exception:
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    scale = min(max_width / width, max_height / height, 1.0)
+    render_width = width * scale
+    render_height = height * scale
+    if layout_reduction_ratio > 0 or bleed_ratio > 0:
+        return OverlapImage(
+            path,
+            render_width,
+            render_height,
+            layout_reduction_ratio=layout_reduction_ratio,
+            bleed_ratio=bleed_ratio,
+        )
+    return RLImage(str(path), width=render_width, height=render_height)
+
+
+def estimate_flowables_height(flowables, width: float, height_limit: float) -> float:
+    used = 0.0
+    remaining = max(height_limit, 1)
+    prev_space_after = 0.0
+    first = True
+    for flowable in flowables:
+        if not first:
+            space_before = float(flowable.getSpaceBefore()) if hasattr(flowable, "getSpaceBefore") else 0.0
+            used += max(space_before - prev_space_after, 0.0)
+            remaining = max(1, height_limit - used)
+        try:
+            _, flow_height = flowable.wrap(width, remaining)
+        except Exception:
+            _, flow_height = flowable.wrap(width, height_limit)
+        used += flow_height
+        prev_space_after = float(flowable.getSpaceAfter()) if hasattr(flowable, "getSpaceAfter") else 0.0
+        first = False
+        remaining = max(1, height_limit - used)
+    if not first:
+        used += max(prev_space_after, 0.0)
+    return used
+
+
+def render_slide_to_pdf_story(
+    spec: SlideSpec,
+    base_dir: Path,
+    styles: PdfStyles,
+    doc_width: float,
+    doc_height: float,
+):
+    pre_image_elements = []
+    post_image_elements = []
+    title = spec.get("slide title") or spec.get("title") or spec.get("term")
+    subtitle = spec.get("subtitle")
+    bullets = normalize_bullets(spec.get("bullets"))
+    teleprompter = spec.get("teleprompter") or spec.get("notes")
+    quote = spec.get("quote")
+    attribution = spec.get("attribution")
+    definition = spec.get("definition")
+    story = spec.get("story")
+    content = spec.get("content")
+    left_title = spec.get("left title")
+    left_bullets = normalize_bullets(spec.get("left bullets"))
+    right_title = spec.get("right title")
+    right_bullets = normalize_bullets(spec.get("right bullets"))
+    youtube = spec.get("youtube") or spec.get("video") or spec.get("link")
+    layout = spec.get("layout").lower().strip()
+    images = [img for img in extract_images_from_spec(spec, base_dir, resolve=True) if img.path]
+
+    pre_image_elements.append(Paragraph(f"Slide {spec.number}", styles.slide_heading))
+    if title.strip():
+        pre_image_elements.append(Paragraph(escape(title), styles.title))
+
+    if subtitle:
+        pre_image_elements.append(Paragraph(escape(subtitle), styles.subtitle))
+
+    is_story = layout in STORY_LAYOUTS or bool(story.strip())
+    is_comparison = layout in COMPARISON_LAYOUTS or any(
+        (value or "").strip() for value in (left_title, spec.get("left bullets"), right_title, spec.get("right bullets"))
+    )
+
+    if is_comparison:
+        left_lines = []
+        if left_title.strip():
+            left_lines.append(f"<b>{escape(left_title.strip())}</b>")
+        for level, text in left_bullets:
+            prefix = "&nbsp;" * (level * 4)
+            left_lines.append(f"{prefix}• {escape(text)}")
+        right_lines = []
+        if right_title.strip():
+            right_lines.append(f"<b>{escape(right_title.strip())}</b>")
+        for level, text in right_bullets:
+            prefix = "&nbsp;" * (level * 4)
+            right_lines.append(f"{prefix}• {escape(text)}")
+        table = Table(
+            [[Paragraph("<br/>".join(left_lines) or "&nbsp;", styles.body), Paragraph("<br/>".join(right_lines) or "&nbsp;", styles.body)]],
+            colWidths=[doc_width / 2 - 4 * mm, doc_width / 2 - 4 * mm],
+            hAlign="LEFT",
+        )
+        table.setStyle(
+            TableStyle(
+                [
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#FBF7F0")),
+                    ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#D6C6B4")),
+                    ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#E6D9CA")),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 8),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+                    ("TOPPADDING", (0, 0), (-1, -1), 8),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+                ]
+            )
+        )
+        pre_image_elements.append(table)
+        pre_image_elements.append(Spacer(1, 2.4 * mm))
+    elif is_story:
+        pre_image_elements.append(Paragraph("Story", styles.callout_label))
+        append_paragraph_blocks(pre_image_elements, story or content or "", styles.callout_body)
+    elif definition or quote:
+        label = "Definition" if definition else "Quote"
+        pre_image_elements.append(Paragraph(label, styles.callout_label))
+        if spec.get("term") and definition:
+            pre_image_elements.append(Paragraph(f"<b>{escape(spec.get('term'))}</b>", styles.callout_body))
+        append_paragraph_blocks(pre_image_elements, definition or quote, styles.callout_body)
+        if attribution:
+            pre_image_elements.append(Paragraph(f"Source: {escape(attribution)}", styles.caption))
+    else:
+        if bullets:
+            append_bullet_flowables(pre_image_elements, bullets, styles.bullet)
+        elif content:
+            append_paragraph_blocks(pre_image_elements, content, styles.body)
+
+    # Keep PDF figures in the document flow. The old overlap offsets could
+    # place tall portrait figures on top of bullets in lecture handouts.
+    layout_reduction_ratio = 0.0
+    bleed_ratio = 0.0
+    image_gap = 0
+    min_image_height = 16 * mm
+    trailing_reserve = 3 * mm
+    post_image_gap = 0
+
+    if youtube:
+        post_image_elements.append(Paragraph(f"Video link: {escape(youtube.strip())}", styles.body))
+
+    if teleprompter:
+        post_image_elements.append(Paragraph("In-Depth Explanation", styles.notes_label))
+        append_paragraph_blocks(post_image_elements, teleprompter, styles.notes)
+
+    reserved_after_images = estimate_flowables_height(post_image_elements, doc_width, doc_height)
+    elements = list(pre_image_elements)
+
+    for idx, image in enumerate(images):
+        remaining_images = len(images) - idx
+        consumed = estimate_flowables_height(elements, doc_width, doc_height)
+        remaining_height = doc_height - consumed - reserved_after_images - trailing_reserve
+        if remaining_height <= 1 * mm:
+            break
+        usable_height = remaining_height
+        if remaining_images > 1:
+            usable_height = usable_height / remaining_images
+        if usable_height < min_image_height:
+            break
+        flowable = build_pdf_image(
+            image.path,
+            max_width=doc_width * 0.99,
+            max_height=usable_height,
+            layout_reduction_ratio=layout_reduction_ratio,
+            bleed_ratio=bleed_ratio,
+        )
+        if flowable is not None:
+            elements.append(flowable)
+
+    elements.extend(post_image_elements)
+
+    total_height = estimate_flowables_height(elements, doc_width, doc_height)
+    if KeepTogether is not None and total_height <= doc_height:
+        return [KeepTogether(elements)]
+    return elements
+
+
+def draw_pdf_page(canvas, doc):
+    canvas.saveState()
+    page_width, page_height = A4
+    fonts = register_pdf_fonts()
+    canvas.setStrokeColor(colors.HexColor("#E6D9CA"))
+    canvas.setLineWidth(0.6)
+    canvas.line(doc.leftMargin, page_height - 12 * mm, page_width - doc.rightMargin, page_height - 12 * mm)
+    canvas.line(doc.leftMargin, 12 * mm, page_width - doc.rightMargin, 12 * mm)
+    canvas.setFont(fonts["regular"], 8.5)
+    canvas.setFillColor(colors.HexColor("#6B7280"))
+    canvas.drawString(doc.leftMargin, 7.5 * mm, "SlideCanon notes")
+    canvas.drawRightString(page_width - doc.rightMargin, 7.5 * mm, f"Page {canvas.getPageNumber()}")
+    canvas.restoreState()
+
+
+def draw_pdf_cover_page(canvas, doc):
+    canvas.saveState()
+    page_width, page_height = A4
+    canvas.setStrokeColor(colors.HexColor("#E6D9CA"))
+    canvas.setLineWidth(0.8)
+    canvas.line(doc.leftMargin, page_height - 18 * mm, page_width - doc.rightMargin, page_height - 18 * mm)
+    canvas.restoreState()
+
+
+def build_pdf_document(markdown: Path, output_pdf: Path):
+    if SimpleDocTemplate is None or A4 is None or mm is None:
+        raise RuntimeError("PDF generation requires reportlab. Install it with: python -m pip install -r requirements.txt")
+    slides = parse_markdown(markdown)
+    styles = create_pdf_styles()
+    doc = SimpleDocTemplate(
+        str(output_pdf),
+        pagesize=A4,
+        leftMargin=18 * mm,
+        rightMargin=18 * mm,
+        topMargin=16 * mm,
+        bottomMargin=16 * mm,
+        title=markdown.stem,
+        author="SlideCanon",
+    )
+    story = []
+    base_dir = markdown.parent
+    story.extend(build_pdf_cover(slides, styles))
+    story.extend(build_pdf_toc(slides, styles))
+    for index, spec in enumerate(slides):
+        story.extend(render_slide_to_pdf_story(spec, base_dir, styles, doc.width, doc.height))
+        if index != len(slides) - 1:
+            if PageBreak is not None:
+                story.append(PageBreak())
+            else:
+                story.append(Spacer(1, 4 * mm))
+                story.append(HRFlowable(width="100%", color=colors.HexColor("#D5B89C"), thickness=0.8))
+                story.append(Spacer(1, 5 * mm))
+    doc.build(story, onFirstPage=draw_pdf_cover_page, onLaterPages=draw_pdf_page)
+
+
 def build_presentation(markdown: Path, template: Path, output: Path, verbose: bool = False):
     prs = Presentation(str(template))
 
@@ -448,7 +1180,7 @@ def build_presentation(markdown: Path, template: Path, output: Path, verbose: bo
     base_dir = markdown.parent
 
     for spec in slides:
-        layout = find_layout(prs, choose_layout_name(spec))
+        layout = find_layout(prs, choose_layout_name(spec, base_dir))
         slide = prs.slides.add_slide(layout)
         populate_slide(slide, spec, base_dir, verbose=verbose)
 
@@ -530,10 +1262,12 @@ def postprocess_pptx(pptx_path: Path, font_scale: float = 1.0):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Build a PPTX from lecture markdown using a real PPTX template and strip local overrides.")
+    ap = argparse.ArgumentParser(description="Build a PPTX and companion A4 PDF from lecture markdown using a real PPTX template.")
     ap.add_argument("--markdown", required=True, help="Path to markdown file.")
     ap.add_argument("--template", required=True, help="Path to template PPTX (e.g. Operating systems002.pptx).")
     ap.add_argument("--output", required=True, help="Output PPTX path.")
+    ap.add_argument("--pdf-output", help="Optional output PDF path. Defaults to the PPTX path with .pdf suffix.")
+    ap.add_argument("--skip-pdf", action="store_true", help="Skip companion PDF generation.")
     ap.add_argument("--font-scale", type=float, default=1.0, help="Scale font sizes in masters/layouts/notes, e.g. 3.0 for 3x larger.")
     ap.add_argument("--verbose", action="store_true", help="Print warnings about unresolved images and layout/image placeholder mismatches.")
     args = ap.parse_args()
@@ -541,11 +1275,17 @@ def main():
     markdown = Path(args.markdown)
     template = Path(args.template)
     output = Path(args.output)
+    pdf_output = Path(args.pdf_output) if args.pdf_output else output.with_suffix(".pdf")
     output.parent.mkdir(parents=True, exist_ok=True)
+    if not args.skip_pdf:
+        pdf_output.parent.mkdir(parents=True, exist_ok=True)
 
     build_presentation(markdown, template, output, verbose=args.verbose)
     postprocess_pptx(output, font_scale=args.font_scale)
     print(f"Saved {output}")
+    if not args.skip_pdf:
+        build_pdf_document(markdown, pdf_output)
+        print(f"Saved {pdf_output}")
 
 
 if __name__ == "__main__":

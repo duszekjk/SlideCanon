@@ -1,6 +1,7 @@
 # SlideCanon
 
 SlideCanon turns structured lecture markdown into PowerPoint decks while preserving real PPTX template layouts and presenter notes.
+It also generates a companion A4 PDF version formatted more like readable course notes than slides.
 
 This script is meant for a lecture-style markdown format like:
 
@@ -10,6 +11,9 @@ This script is meant for a lecture-style markdown format like:
 - `## subtitle`
 - `## bullets`
 - `## term` / `## definition`
+- `## story`
+- `## left title` / `## left bullets`
+- `## right title` / `## right bullets`
 - `## quote` / `## attribution`
 - `## teleprompter`
 - optional: `## image`, `## photo`, `## visual`, `## visualization`, `## chart`, `## youtube`
@@ -18,8 +22,10 @@ This script is meant for a lecture-style markdown format like:
 
 - loads an existing PPTX template,
 - creates new slides from the template's **real layouts**,
+- generates a companion **A4 PDF** from the same markdown,
 - fills **template placeholders** instead of drawing text boxes by hand,
 - copies teleprompter text into presenter notes,
+- includes teleprompter content in the PDF as readable speaker-notes sections,
 - optionally inserts images into picture placeholders,
 - removes **local text/font overrides** from slides and notes,
 - removes slide numbers from layouts/masters.
@@ -31,6 +37,7 @@ The script was written against templates like:
 - `Title`
 - `Title & Bullets`
 - `Quote`
+- `Comparison` or another two-content layout when the template provides one
 - `Title, Bullets & Photo`
 - `Title & Photo`
 - `Title Only`
@@ -64,6 +71,16 @@ python slidecanon.py \
   --output example_lecture_out.pptx \
   --verbose
 ```
+
+This creates:
+
+- `example_lecture_out.pptx`
+- `example_lecture_out.pdf`
+
+Optional flags:
+
+- `--pdf-output /path/to/output.pdf`
+- `--skip-pdf`
 
 ## Notes
 
