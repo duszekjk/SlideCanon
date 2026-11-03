@@ -128,7 +128,10 @@ class PdfStyles:
     callout_body: ParagraphStyle
     notes_label: ParagraphStyle
     notes: ParagraphStyle
-    caption: Par# The same DejaVu Sans TTF files ship with Matplotlib on macOS and Linux.
+    caption: ParagraphStyle
+
+
+# The same DejaVu Sans TTF files ship with Matplotlib on macOS and Linux.
 # Unlike PDF's built-in Helvetica, this family covers Polish diacritics,
 # Greek letters, and common mathematical superscript/subscript characters.
 _PDF_GLYPH_COVERAGE = None
@@ -243,7 +246,6 @@ def escape(value: str) -> str:
     flush_math()
     flush_plain()
     return "".join(fragments)
-turn fallback
 
 
 class OverlapImage(Flowable):
