@@ -100,6 +100,37 @@ Optional flags:
 
 If the markdown content is much longer than the template placeholder was designed for, PowerPoint will still overflow or shrink text visually depending on the template behavior. This script intentionally does **not** set per-slide font sizes, because the goal is to inherit from the template.
 
+## Unicode fonts in PDF output (macOS and Linux)
+
+SlideCanon embeds **DejaVu Sans** from the Matplotlib package for all A4 PDF text.
+The same regular, bold, oblique, and bold-oblique TrueType files are used on
+macOS and Linux, so PDF text no longer depends on the computer's Arial fonts
+or silently falls back to PDF's built-in Helvetica.
+
+After installing `requirements.txt`, Unicode examples such as
+`Zażółć gęślą jaźń`, `H₂O`, `x²`, `x⁻¹`, `log₂`,
+`∑`, `≤`, and `α` are supported with embedded, searchable fonts.
+
+For advanced mathematical Unicode symbols absent from DejaVu Sans, such as
+`𝑥` (MATHEMATICAL ITALIC SMALL X), SlideCanon can use **Noto Sans Math**
+when installed locally (for example, in `~/Library/Fonts` on macOS or
+`/usr/share/fonts/truetype/noto` on Linux). It embeds the needed fallback
+glyphs in the generated PDF. If no installed font contains a requested glyph,
+SlideCanon raises a descriptive error rather than generating unreadable
+square placeholders. Install Noto Sans Math or render complex formulas
+as images if required.
+
+**Scope:** This fixes font selection for SlideCanon's companion A4 notes PDF.
+PPTX typography is still inherited from the supplied PowerPoint template;
+a separate slide-only PDF exported by PowerPoint/LibreOffice uses that
+application's font configuration.
+
+Run the regression tests with:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
 ## Environment setup
 
 Create and populate a virtual environment:

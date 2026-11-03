@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import xml.etree.ElementTree as ET
-from xml.sax.saxutils import escape
+from xml.sax.saxutils import escape as xml_escape
 
 from PIL import Image as PILImage
 from pptx import Presentation
@@ -131,51 +131,121 @@ class PdfStyles:
     caption: ParagraphStyle
 
 
+# The same DejaVu Sans TTF files ship with Matplotlib on macOS and Linux.
+# Unlike PDF's built-in Helvetica, this family covers Polish diacritics,
+# Greek letters, and common mathematical superscript/subscript characters.
+_PDF_GLYPH_COVERAGE = None
+_PDF_MATH_FONT = None
+
+
 def register_pdf_fonts() -> Dict[str, str]:
-    fallback = {
-        "regular": "Helvetica",
-        "bold": "Helvetica-Bold",
-        "italic": "Helvetica-Oblique",
-        "bold_italic": "Helvetica-BoldOblique",
-    }
+    """Register portable, embedded PDF fonts; never silently use Helvetica."""
+    global _PDF_GLYPH_COVERAGE, _PDF_MATH_FONT
     if pdfmetrics is None or TTFont is None:
-        return fallback
+        raise RuntimeError("PDF generation requires ReportLab.")
 
+    try:
+        import matplotlib
+    except ImportError as exc:
+        raise RuntimeError(
+            "PDF generation requires Matplotlib's bundled DejaVu Sans fonts. "
+            "Run: python -m pip install -r requirements.txt"
+        ) from exc
+
+    font_dir = Path(matplotlib.get_data_path()) / "fonts" / "ttf"
+    paths = {
+        "regular": font_dir / "DejaVuSans.ttf",
+        "bold": font_dir / "DejaVuSans-Bold.ttf",
+        "italic": font_dir / "DejaVuSans-Oblique.ttf",
+        "bold_italic": font_dir / "DejaVuSans-BoldOblique.ttf",
+    }
+    missing = [str(path) for path in paths.values() if not path.is_file()]
+    if missing:
+        raise RuntimeError(f"Missing bundled Unicode PDF fonts: {', '.join(missing)}")
+
+    names = {
+        "regular": "SlideCanonDejaVu-Regular",
+        "bold": "SlideCanonDejaVu-Bold",
+        "italic": "SlideCanonDejaVu-Italic",
+        "bold_italic": "SlideCanonDejaVu-BoldItalic",
+    }
+    for style, path in paths.items():
+        if names[style] not in pdfmetrics.getRegisteredFontNames():
+            pdfmetrics.registerFont(TTFont(names[style], str(path)))
+    pdfmetrics.registerFontFamily(
+        names["regular"],
+        normal=names["regular"], bold=names["bold"],
+        italic=names["italic"], boldItalic=names["bold_italic"],
+    )
+    # Only characters available across all styles are used without font tags.
+    # This avoids glyph loss in bold/italic headings and notes.
+    coverage = [set(pdfmetrics.getFont(name).face.charToGlyph) for name in names.values()]
+    _PDF_GLYPH_COVERAGE = set.intersection(*coverage)
+
+    # Supplementary mathematical Unicode symbols (e.g. U+1D465 MATHEMATICAL
+    # ITALIC SMALL X) are in Noto Sans Math, not the main DejaVu family.
+    # This optional fallback is used only for glyphs missing from DejaVu.
     candidates = [
-        {
-            "regular": "/System/Library/Fonts/Supplemental/Arial.ttf",
-            "bold": "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
-            "italic": "/System/Library/Fonts/Supplemental/Arial Italic.ttf",
-            "bold_italic": "/System/Library/Fonts/Supplemental/Arial Bold Italic.ttf",
-            "prefix": "SlideCanonArial",
-        },
-        {
-            "regular": "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
-            "bold": "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
-            "italic": "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
-            "bold_italic": "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
-            "prefix": "SlideCanonArialUnicode",
-        },
+        Path("/usr/share/fonts/truetype/noto/NotoSansMath-Regular.ttf"),
+        Path("/usr/local/share/fonts/NotoSansMath-Regular.ttf"),
+        Path.home() / "Library/Fonts/NotoSansMath-Regular.ttf",
+        Path("/Library/Fonts/NotoSansMath-Regular.ttf"),
     ]
-
+    _PDF_MATH_FONT = None
     for candidate in candidates:
-        if not all(Path(path).exists() for path in candidate.values() if path != candidate["prefix"]):
-            continue
-        try:
-            names = {
-                "regular": f"{candidate['prefix']}-Regular",
-                "bold": f"{candidate['prefix']}-Bold",
-                "italic": f"{candidate['prefix']}-Italic",
-                "bold_italic": f"{candidate['prefix']}-BoldItalic",
-            }
-            pdfmetrics.registerFont(TTFont(names["regular"], candidate["regular"]))
-            pdfmetrics.registerFont(TTFont(names["bold"], candidate["bold"]))
-            pdfmetrics.registerFont(TTFont(names["italic"], candidate["italic"]))
-            pdfmetrics.registerFont(TTFont(names["bold_italic"], candidate["bold_italic"]))
-            return names
-        except Exception:
-            continue
-    return fallback
+        if candidate.is_file():
+            fontname = "SlideCanonNotoMath"
+            if fontname not in pdfmetrics.getRegisteredFontNames():
+                pdfmetrics.registerFont(TTFont(fontname, str(candidate)))
+            _PDF_MATH_FONT = fontname
+            break
+    return names
+
+
+def escape(value: str) -> str:
+    """XML-escape text, switching font only for non-DejaVu math glyphs.
+
+    Missing glyphs produce actionable errors instead of black squares in PDFs.
+    This helper is used for ReportLab Paragraph text, not PPTX XML.
+    """
+    if _PDF_GLYPH_COVERAGE is None:
+        register_pdf_fonts()
+    fragments = []
+    plain = []
+    math = []
+    math_coverage = (
+        set(pdfmetrics.getFont(_PDF_MATH_FONT).face.charToGlyph)
+        if _PDF_MATH_FONT else set()
+    )
+
+    def flush_plain():
+        if plain:
+            fragments.append(xml_escape("".join(plain)))
+            plain.clear()
+
+    def flush_math():
+        if math:
+            fragments.append(f'<font name="{_PDF_MATH_FONT}">' + xml_escape("".join(math)) + '</font>')
+            math.clear()
+
+    for char in str(value):
+        # Newlines, tabs and carriage returns are structural, not glyphs.
+        if char in "\n\r\t" or ord(char) in _PDF_GLYPH_COVERAGE:
+            flush_math()
+            plain.append(char)
+        elif ord(char) in math_coverage:
+            flush_plain()
+            math.append(char)
+        else:
+            raise ValueError(
+                f"No embedded PDF font contains U+{ord(char):04X} "
+                f"({char!r}). Install Noto Sans Math for additional math "
+                "symbols, or use a formula image. SlideCanon will not "
+                "silently render missing glyphs."
+            )
+    flush_math()
+    flush_plain()
+    return "".join(fragments)
 
 
 class OverlapImage(Flowable):
